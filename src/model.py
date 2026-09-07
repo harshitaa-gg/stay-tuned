@@ -1,17 +1,18 @@
-"""Phase 5 & 6: Data Preparation, Stratified Train/Test Split & Preprocessing Pipeline module for Stay-Tuned.
+"""Phase 5, 6 & 7: Machine Learning Modeling Pipeline for Stay-Tuned.
 
-This module:
-1. Prepares clean feature matrix (X) and target vector (y) from engineered features.
-2. Executes an 80/20 stratified train/test split.
-3. Constructs a leakage-safe ColumnTransformer preprocessing pipeline and full Scikit-learn model pipeline.
+This module encompasses:
+1. Data preparation (aligning features and targets into X, y).
+2. Stratified 80/20 train/test split (isolating the holdout test set).
+3. Leakage-safe Scikit-learn preprocessing ColumnTransformer and model Pipeline builder.
+4. Stratified 5-Fold Cross-Validation model comparison across Baseline, Logistic Regression,
+   Random Forest, and XGBoost on training data only.
+5. Full training set pipeline fitting.
 
-Important Design & Anti-Leakage Rules:
--------------------------------------
-- X_train and y_train are designated for model training, cross-validation, and hyperparameter tuning.
-- X_test and y_test are strictly held out untouched until final model evaluation.
-- No scaling, encoding, imputation, or preprocessing is fitted across the full dataset or holdout set.
-- All preprocessing transformations are encapsulated within a Scikit-learn Pipeline so that during
-  cross-validation, transformers are fitted strictly on the training fold and applied to validation/test folds.
+Anti-Leakage Architecture:
+--------------------------
+- X_test and y_test are NEVER accessed during model selection, cross-validation, or tuning.
+- All preprocessing (imputation, scaling) is encapsulated inside Pipelines so it is fitted
+  strictly on each training fold during cross-validation.
 """
 
 import sys
@@ -24,12 +25,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
 
 from src.data_loader import load_oulad_tables
 from src.problem_definition import scope_to_module, compute_target
@@ -260,6 +264,122 @@ def build_model_pipeline(preprocessor, classifier):
     return pipeline
 
 
+def compare_models(X_train, y_train, preprocessor):
+    """Evaluate and compare multiple ML models using Stratified 5-Fold Cross-Validation on training data.
+
+    Parameters
+    ----------
+    X_train : pandas.DataFrame
+        Training feature matrix (N_train = 297).
+    y_train : pandas.Series
+        Training target vector.
+    preprocessor : sklearn.compose.ColumnTransformer
+        Unfitted preprocessing pipeline definition.
+
+    Returns
+    -------
+    tuple
+        (fitted_models, results_df)
+        - fitted_models : dict of {str: Pipeline}, each fitted on full X_train, y_train
+        - results_df : pandas.DataFrame, sorted by pr_auc_mean desc, f1_mean desc
+    """
+    # 1. Define four models
+    baseline = DummyClassifier(
+        strategy="most_frequent"
+    )
+
+    logistic_regression = LogisticRegression(
+        max_iter=1000,
+        class_weight="balanced",
+        random_state=42,
+    )
+
+    random_forest = RandomForestClassifier(
+        n_estimators=100,
+        class_weight="balanced",
+        random_state=42,
+    )
+
+    xgboost = XGBClassifier(
+        n_estimators=100,
+        eval_metric="logloss",
+        random_state=42,
+    )
+
+    # 2. Define model dictionary
+    models = {
+        "baseline": baseline,
+        "logistic_regression": logistic_regression,
+        "random_forest": random_forest,
+        "xgboost": xgboost,
+    }
+
+    # 3. Create stratified 5-fold cross-validation
+    cv = StratifiedKFold(
+        n_splits=5,
+        shuffle=True,
+        random_state=42,
+    )
+
+    # 4. Evaluate models using ONLY training data
+    scoring = [
+        "roc_auc",
+        "f1",
+        "precision",
+        "recall",
+        "average_precision",
+    ]
+
+    results_list = []
+
+    for name, model in models.items():
+        # Build complete pipeline
+        pipeline = build_model_pipeline(preprocessor, model)
+
+        # Run cross-validation strictly on training data
+        cv_results = cross_validate(
+            pipeline,
+            X_train,
+            y_train,
+            cv=cv,
+            scoring=scoring,
+            n_jobs=-1,
+        )
+
+        results_list.append({
+            "model": name,
+            "pr_auc_mean": float(np.mean(cv_results["test_average_precision"])),
+            "pr_auc_std": float(np.std(cv_results["test_average_precision"])),
+            "f1_mean": float(np.mean(cv_results["test_f1"])),
+            "f1_std": float(np.std(cv_results["test_f1"])),
+            "recall_mean": float(np.mean(cv_results["test_recall"])),
+            "recall_std": float(np.std(cv_results["test_recall"])),
+            "precision_mean": float(np.mean(cv_results["test_precision"])),
+            "precision_std": float(np.std(cv_results["test_precision"])),
+            "roc_auc_mean": float(np.mean(cv_results["test_roc_auc"])),
+            "roc_auc_std": float(np.std(cv_results["test_roc_auc"])),
+        })
+
+    # 5. Create comparison DataFrame and sort by PR-AUC and F1 descending
+    results_df = pd.DataFrame(results_list)
+    results_df = results_df.sort_values(
+        by=["pr_auc_mean", "f1_mean"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+
+    # Select the best model based on cross-validation results above,
+    # NOT holdout test set performance.
+
+    # 6. Fit each pipeline on full training set
+    fitted_models = {}
+    for name, model in models.items():
+        full_pipeline = build_model_pipeline(preprocessor, model)
+        full_pipeline.fit(X_train, y_train)
+        fitted_models[name] = full_pipeline
+
+    return fitted_models, results_df
+
+
 def print_phase5_validation_report(X, y, X_train, X_test, y_train, y_test, num_features, cat_features):
     """Print the official Phase 5 validation report verifying all constraints."""
     print("=" * 80)
@@ -315,6 +435,47 @@ def print_phase6_validation_report(preprocessor, sample_pipeline, num_features, 
     assert len(num_features) == 8, f"Expected 8 numerical features, got {len(num_features)}"
 
     print("ALL PHASE 6 CHECKS PASSED: Preprocessing and model pipeline definitions are leakage-safe.")
+    print("=" * 80 + "\n")
+
+
+def print_phase7_validation_report(results_df, fitted_models, n_train):
+    """Print the official Phase 7 model comparison and cross-validation report."""
+    print("=" * 80)
+    print("PHASE 7: MODEL TRAINING & CROSS-VALIDATION REPORT")
+    print("=" * 80)
+    print(f"Training Cohort Size:            {n_train} students")
+    print("Cross-Validation Strategy:       5-Fold StratifiedKFold (shuffle=True, random_state=42)")
+    print("Evaluated Models:                1. baseline (DummyClassifier)")
+    print("                                 2. logistic_regression")
+    print("                                 3. random_forest")
+    print("                                 4. xgboost")
+    print("Evaluation Metrics:              PR-AUC (avg_precision), F1, Recall, Precision, ROC-AUC")
+    print("Data Source for Selection:       X_train, y_train ONLY (Holdout test set untouched)")
+    print("-" * 80)
+    print("Model Cross-Validation Comparison Table (sorted by PR-AUC desc):")
+    print("-" * 80)
+
+    # Format table nicely
+    formatted_df = results_df.copy()
+    formatted_df["PR-AUC"] = formatted_df.apply(lambda r: f"{r['pr_auc_mean']:.4f} +/- {r['pr_auc_std']:.4f}", axis=1)
+    formatted_df["F1"] = formatted_df.apply(lambda r: f"{r['f1_mean']:.4f} +/- {r['f1_std']:.4f}", axis=1)
+    formatted_df["Recall"] = formatted_df.apply(lambda r: f"{r['recall_mean']:.4f} +/- {r['recall_std']:.4f}", axis=1)
+    formatted_df["Precision"] = formatted_df.apply(lambda r: f"{r['precision_mean']:.4f} +/- {r['precision_std']:.4f}", axis=1)
+    formatted_df["ROC-AUC"] = formatted_df.apply(lambda r: f"{r['roc_auc_mean']:.4f} +/- {r['roc_auc_std']:.4f}", axis=1)
+
+    display_cols = ["model", "PR-AUC", "F1", "Recall", "Precision", "ROC-AUC"]
+    print(formatted_df[display_cols].to_string(index=False))
+    print("-" * 80)
+
+    # Assertions
+    assert len(results_df) == 4, f"Expected 4 models in comparison table, got {len(results_df)}"
+    assert len(fitted_models) == 4, f"Expected 4 fitted pipelines, got {len(fitted_models)}"
+    for name, pipe in fitted_models.items():
+        assert hasattr(pipe.named_steps["classifier"], "classes_"), f"Model {name} was not fitted on X_train"
+        assert hasattr(pipe.named_steps["preprocessor"], "transformers_"), f"Preprocessor for {name} was not fitted on X_train"
+
+    print("ALL PHASE 7 CHECKS PASSED: 4 models compared via 5-Fold Stratified CV on X_train.")
+    print("All pipelines fitted on complete X_train. Holdout test set remains completely untouched.")
     print("=" * 80 + "\n")
 
 
@@ -380,4 +541,18 @@ if __name__ == "__main__":
         sample_pipeline=sample_pipeline,
         num_features=num_features,
         cat_features=cat_features,
+    )
+
+    # 11. Run Phase 7 Model Comparison & Cross-Validation
+    fitted_models, cv_results_df = compare_models(
+        X_train=X_train,
+        y_train=y_train,
+        preprocessor=preprocessor,
+    )
+
+    # 12. Print official Phase 7 validation report
+    print_phase7_validation_report(
+        results_df=cv_results_df,
+        fitted_models=fitted_models,
+        n_train=len(X_train),
     )
