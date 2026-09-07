@@ -1,13 +1,17 @@
-"""Phase 5: Data Preparation & Stratified Train/Test Split module for Stay-Tuned.
+"""Phase 5 & 6: Data Preparation, Stratified Train/Test Split & Preprocessing Pipeline module for Stay-Tuned.
 
-This module prepares the clean feature matrix (X) and target vector (y) from the engineered
-features and target definitions, and executes an 80/20 stratified train/test split.
+This module:
+1. Prepares clean feature matrix (X) and target vector (y) from engineered features.
+2. Executes an 80/20 stratified train/test split.
+3. Constructs a leakage-safe ColumnTransformer preprocessing pipeline and full Scikit-learn model pipeline.
 
-Important Design Rule:
-----------------------
-X_train and y_train are designated for model training, cross-validation, and hyperparameter tuning.
-X_test and y_test are strictly held out untouched until final model evaluation.
-No scaling, encoding, imputation, or preprocessing is fitted across the full dataset.
+Important Design & Anti-Leakage Rules:
+-------------------------------------
+- X_train and y_train are designated for model training, cross-validation, and hyperparameter tuning.
+- X_test and y_test are strictly held out untouched until final model evaluation.
+- No scaling, encoding, imputation, or preprocessing is fitted across the full dataset or holdout set.
+- All preprocessing transformations are encapsulated within a Scikit-learn Pipeline so that during
+  cross-validation, transformers are fitted strictly on the training fold and applied to validation/test folds.
 """
 
 import sys
@@ -21,6 +25,11 @@ if str(PROJECT_ROOT) not in sys.path:
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.linear_model import LogisticRegression
 
 from src.data_loader import load_oulad_tables
 from src.problem_definition import scope_to_module, compute_target
@@ -175,6 +184,82 @@ def split_data(X, y, test_size=0.2, random_state=42):
     return X_train, X_test, y_train, y_test
 
 
+def build_preprocessing_pipeline(numerical_features, categorical_features):
+    """Construct an unfitted Scikit-learn ColumnTransformer preprocessing pipeline.
+
+    Parameters
+    ----------
+    numerical_features : list of str
+        List of numerical feature column names.
+    categorical_features : list of str
+        List of categorical feature column names.
+
+    Returns
+    -------
+    sklearn.compose.ColumnTransformer
+        Unfitted ColumnTransformer defining median imputation + standard scaling for numerical
+        features, and most-frequent imputation + one-hot encoding for categorical features.
+    """
+    transformers = []
+
+    # 1. Numerical preprocessing pipeline: Median Imputation -> StandardScaler
+    if len(numerical_features) > 0:
+        numerical_pipeline = Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+            ]
+        )
+        transformers.append(("num", numerical_pipeline, numerical_features))
+
+    # 2. Categorical preprocessing pipeline: Most Frequent Imputation -> OneHotEncoder
+    if len(categorical_features) > 0:
+        categorical_pipeline = Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                ("encoder", OneHotEncoder(handle_unknown="ignore")),
+            ]
+        )
+        transformers.append(("cat", categorical_pipeline, categorical_features))
+
+    # 3. Combine transformations
+    preprocessor = ColumnTransformer(
+        transformers=transformers,
+        remainder="drop",
+    )
+
+    return preprocessor
+
+
+def build_model_pipeline(preprocessor, classifier):
+    """Combine an unfitted preprocessor and an unfitted classifier into a complete ML Pipeline.
+
+    Parameters
+    ----------
+    preprocessor : sklearn.compose.ColumnTransformer
+        Unfitted ColumnTransformer preprocessing definition.
+    classifier : estimator object
+        Unfitted Scikit-learn or XGBoost classifier estimator.
+
+    Returns
+    -------
+    sklearn.pipeline.Pipeline
+        Unfitted complete model pipeline.
+    """
+    # We use a Pipeline instead of manually preprocessing the data to prevent
+    # data leakage. During training and cross-validation, preprocessing steps
+    # such as imputation and scaling are fitted only on the training portion
+    # of the data. The learned statistics are then applied to validation or
+    # test data without allowing those datasets to influence the preprocessing.
+    pipeline = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("classifier", classifier),
+        ]
+    )
+    return pipeline
+
+
 def print_phase5_validation_report(X, y, X_train, X_test, y_train, y_test, num_features, cat_features):
     """Print the official Phase 5 validation report verifying all constraints."""
     print("=" * 80)
@@ -204,6 +289,32 @@ def print_phase5_validation_report(X, y, X_train, X_test, y_train, y_test, num_f
 
     print("ALL PHASE 5 CHECKS PASSED: Data prepared and stratified split executed successfully.")
     print("Holdout test set is safely isolated for final evaluation.")
+    print("=" * 80 + "\n")
+
+
+def print_phase6_validation_report(preprocessor, sample_pipeline, num_features, cat_features):
+    """Print the official Phase 6 validation report verifying the unfitted pipeline."""
+    print("=" * 80)
+    print("PHASE 6: PREPROCESSING PIPELINE VALIDATION REPORT")
+    print("=" * 80)
+    print(f"1. Number of Numerical Features:         {len(num_features)} (Expected: 8)")
+    print(f"2. Number of Categorical Features:       {len(cat_features)} (Expected: 0)")
+    print("3. Numerical Preprocessing Steps:        Median Imputation -> StandardScaler")
+    print("4. Categorical Preprocessing Steps:      Most Frequent Imputation -> OneHotEncoder")
+    print(f"5. Preprocessor Type:                    {type(preprocessor).__name__}")
+    print(f"6. Preprocessor Status:                  Defined but NOT fitted (hasattr 'transformers_': {hasattr(preprocessor, 'transformers_')})")
+    print(f"7. Sample Model Pipeline Type:           {type(sample_pipeline).__name__}")
+    print(f"8. Sample Pipeline Steps:                {list(sample_pipeline.named_steps.keys())}")
+    print(f"9. Model Pipeline Status:                Defined but NOT fitted (Holdout test set untouched)")
+    print("-" * 80)
+
+    # Assertions
+    assert isinstance(preprocessor, ColumnTransformer), "preprocessor must be a ColumnTransformer"
+    assert isinstance(sample_pipeline, Pipeline), "sample_pipeline must be a Pipeline"
+    assert hasattr(preprocessor, "transformers_") is False, "Preprocessor must NOT be fitted in Phase 6!"
+    assert len(num_features) == 8, f"Expected 8 numerical features, got {len(num_features)}"
+
+    print("ALL PHASE 6 CHECKS PASSED: Preprocessing and model pipeline definitions are leakage-safe.")
     print("=" * 80 + "\n")
 
 
@@ -240,13 +351,33 @@ if __name__ == "__main__":
         obs_end_day=14,
     )
 
-    # 6. Prepare X, y, and feature type lists
+    # 6. Prepare X, y, and feature type lists (Phase 5)
     X, y, num_features, cat_features = prepare_data(features_df, targets_df)
 
-    # 7. Execute 80/20 Stratified Split
+    # 7. Execute 80/20 Stratified Split (Phase 5)
     X_train, X_test, y_train, y_test = split_data(X, y, test_size=0.2, random_state=42)
 
     # 8. Print official Phase 5 validation report
     print_phase5_validation_report(
         X, y, X_train, X_test, y_train, y_test, num_features, cat_features
+    )
+
+    # 9. Build Preprocessing and Sample Model Pipeline (Phase 6)
+    preprocessor = build_preprocessing_pipeline(
+        numerical_features=num_features,
+        categorical_features=cat_features,
+    )
+
+    sample_classifier = LogisticRegression(random_state=42)
+    sample_pipeline = build_model_pipeline(
+        preprocessor=preprocessor,
+        classifier=sample_classifier,
+    )
+
+    # 10. Print official Phase 6 validation report
+    print_phase6_validation_report(
+        preprocessor=preprocessor,
+        sample_pipeline=sample_pipeline,
+        num_features=num_features,
+        cat_features=cat_features,
     )
