@@ -1,4 +1,4 @@
-"""Phase 5, 6 & 7: Machine Learning Modeling Pipeline for Stay-Tuned.
+"""Phase 5, 6, 7 & 8: Machine Learning Modeling Pipeline for Stay-Tuned.
 
 This module encompasses:
 1. Data preparation (aligning features and targets into X, y).
@@ -6,13 +6,15 @@ This module encompasses:
 3. Leakage-safe Scikit-learn preprocessing ColumnTransformer and model Pipeline builder.
 4. Stratified 5-Fold Cross-Validation model comparison across Baseline, Logistic Regression,
    Random Forest, and XGBoost on training data only.
-5. Full training set pipeline fitting.
+5. Hyperparameter tuning of Random Forest and XGBoost using RandomizedSearchCV (Phase 8).
+6. Multi-metric cross-validation comparison of tuned candidate models.
 
 Anti-Leakage Architecture:
 --------------------------
 - X_test and y_test are NEVER accessed during model selection, cross-validation, or tuning.
 - All preprocessing (imputation, scaling) is encapsulated inside Pipelines so it is fitted
   strictly on each training fold during cross-validation.
+- Best model selection and operational threshold analysis are deferred until after tuned CV review.
 """
 
 import sys
@@ -25,7 +27,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
+from sklearn.model_selection import (
+    train_test_split,
+    StratifiedKFold,
+    cross_validate,
+    RandomizedSearchCV,
+)
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
@@ -33,7 +40,9 @@ from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.base import clone
 from xgboost import XGBClassifier
+import joblib
 
 from src.data_loader import load_oulad_tables
 from src.problem_definition import scope_to_module, compute_target
@@ -334,7 +343,7 @@ def compare_models(X_train, y_train, preprocessor):
 
     for name, model in models.items():
         # Build complete pipeline
-        pipeline = build_model_pipeline(preprocessor, model)
+        pipeline = build_model_pipeline(clone(preprocessor), model)
 
         # Run cross-validation strictly on training data
         cv_results = cross_validate(
@@ -373,11 +382,285 @@ def compare_models(X_train, y_train, preprocessor):
     # 6. Fit each pipeline on full training set
     fitted_models = {}
     for name, model in models.items():
-        full_pipeline = build_model_pipeline(preprocessor, model)
+        full_pipeline = build_model_pipeline(clone(preprocessor), model)
         full_pipeline.fit(X_train, y_train)
         fitted_models[name] = full_pipeline
 
     return fitted_models, results_df
+
+
+def tune_model(X_train, y_train, preprocessor, model_name):
+    """Tune hyperparameters for a candidate model using RandomizedSearchCV on X_train only.
+
+    Parameters
+    ----------
+    X_train : pandas.DataFrame
+        Training feature matrix (N=297).
+    y_train : pandas.Series
+        Training target vector.
+    preprocessor : sklearn.compose.ColumnTransformer
+        Unfitted preprocessing pipeline definition.
+    model_name : str
+        Candidate model identifier ('random_forest' or 'xgboost').
+
+    Returns
+    -------
+    tuple
+        (best_pipeline, best_params, best_cv_score)
+        - best_pipeline : Pipeline, refitted on the full X_train, y_train
+        - best_params : dict, optimal hyperparameters found
+        - best_cv_score : float, mean PR-AUC across the 5 CV folds for best_params
+    """
+    if model_name == "random_forest":
+        base_model = RandomForestClassifier(random_state=42)
+        param_distributions = {
+            "classifier__n_estimators": [100, 200, 300, 500],
+            "classifier__max_depth": [None, 5, 10, 15, 20],
+            "classifier__min_samples_leaf": [1, 2, 5, 10],
+            "classifier__max_features": ["sqrt", "log2", 0.5],
+            "classifier__class_weight": ["balanced", "balanced_subsample"],
+        }
+    elif model_name == "xgboost":
+        # Calculate class imbalance ratio dynamically from y_train only
+        scale_pos_weight = float((y_train == 0).sum() / (y_train == 1).sum())
+        base_model = XGBClassifier(
+            use_label_encoder=False,
+            eval_metric="logloss",
+            random_state=42,
+            scale_pos_weight=scale_pos_weight,
+        )
+        param_distributions = {
+            "classifier__n_estimators": [100, 200, 300],
+            "classifier__max_depth": [3, 4, 5, 6],
+            "classifier__learning_rate": [0.01, 0.05, 0.1, 0.2],
+            "classifier__subsample": [0.6, 0.8, 1.0],
+            "classifier__colsample_bytree": [0.6, 0.8, 1.0],
+        }
+    else:
+        raise ValueError(
+            f"Unsupported model_name: '{model_name}'. Must be 'random_forest' or 'xgboost'."
+        )
+
+    # Build leakage-safe pipeline:
+    # The pipeline ensures preprocessing is fitted separately inside each cross-validation training fold.
+    pipeline = build_model_pipeline(clone(preprocessor), base_model)
+
+    cv = StratifiedKFold(
+        n_splits=5,
+        shuffle=True,
+        random_state=42,
+    )
+
+    randomized_search = RandomizedSearchCV(
+        estimator=pipeline,
+        param_distributions=param_distributions,
+        n_iter=30,
+        cv=cv,
+        scoring="average_precision",
+        n_jobs=-1,
+        random_state=42,
+        refit=True,
+    )
+
+    # Fit hyperparameter search strictly using X_train and y_train only
+    randomized_search.fit(X_train, y_train)
+
+    best_pipeline = randomized_search.best_estimator_
+    best_params = randomized_search.best_params_
+    best_cv_score = float(randomized_search.best_score_)
+
+    print("=" * 60)
+    print("PHASE 8: HYPERPARAMETER TUNING")
+    print("=" * 60)
+    print(f"Model:                        {model_name}")
+    print(f"Best Parameters:              {best_params}")
+    print(f"Best Cross-Validation PR-AUC: {best_cv_score:.4f}")
+    print("=" * 60 + "\n")
+
+    return best_pipeline, best_params, best_cv_score
+
+
+def tune_candidate_models(X_train, y_train, preprocessor):
+    """Tune both Random Forest and XGBoost candidate models on X_train.
+
+    Parameters
+    ----------
+    X_train : pandas.DataFrame
+        Training feature matrix.
+    y_train : pandas.Series
+        Training target vector.
+    preprocessor : sklearn.compose.ColumnTransformer
+        Unfitted ColumnTransformer.
+
+    Returns
+    -------
+    dict
+        Dictionary containing tuned pipelines, parameters, and CV PR-AUC scores.
+    """
+    # 1. Tune Random Forest
+    rf_pipe, rf_params, rf_score = tune_model(
+        X_train=X_train,
+        y_train=y_train,
+        preprocessor=preprocessor,
+        model_name="random_forest",
+    )
+
+    # 2. Tune XGBoost
+    xgb_pipe, xgb_params, xgb_score = tune_model(
+        X_train=X_train,
+        y_train=y_train,
+        preprocessor=preprocessor,
+        model_name="xgboost",
+    )
+
+    tuned_models = {
+        "random_forest": {
+            "pipeline": rf_pipe,
+            "best_params": rf_params,
+            "best_cv_pr_auc": rf_score,
+        },
+        "xgboost": {
+            "pipeline": xgb_pipe,
+            "best_params": xgb_params,
+            "best_cv_pr_auc": xgb_score,
+        },
+    }
+
+    return tuned_models
+
+
+def compare_tuned_models(X_train, y_train, tuned_models):
+    """Compare the best tuned models across multiple metrics using 5-Fold Stratified CV on X_train.
+
+    Parameters
+    ----------
+    X_train : pandas.DataFrame
+        Training feature matrix.
+    y_train : pandas.Series
+        Training target vector.
+    tuned_models : dict
+        Dictionary of tuned models returned by tune_candidate_models.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Comparison DataFrame with rows 'random_forest_tuned' and 'xgboost_tuned'.
+    """
+    cv = StratifiedKFold(
+        n_splits=5,
+        shuffle=True,
+        random_state=42,
+    )
+
+    scoring = [
+        "roc_auc",
+        "f1",
+        "precision",
+        "recall",
+        "average_precision",
+    ]
+
+    results_list = []
+
+    for name in ["random_forest", "xgboost"]:
+        model_info = tuned_models[name]
+        pipeline = model_info["pipeline"]
+
+        cv_results = cross_validate(
+            pipeline,
+            X_train,
+            y_train,
+            cv=cv,
+            scoring=scoring,
+            n_jobs=-1,
+        )
+
+        results_list.append({
+            "model": f"{name}_tuned",
+            "pr_auc_mean": float(np.mean(cv_results["test_average_precision"])),
+            "pr_auc_std": float(np.std(cv_results["test_average_precision"])),
+            "f1_mean": float(np.mean(cv_results["test_f1"])),
+            "f1_std": float(np.std(cv_results["test_f1"])),
+            "recall_mean": float(np.mean(cv_results["test_recall"])),
+            "recall_std": float(np.std(cv_results["test_recall"])),
+            "precision_mean": float(np.mean(cv_results["test_precision"])),
+            "precision_std": float(np.std(cv_results["test_precision"])),
+            "roc_auc_mean": float(np.mean(cv_results["test_roc_auc"])),
+            "roc_auc_std": float(np.std(cv_results["test_roc_auc"])),
+        })
+
+    # Final model selection must be based on cross-validation results from
+    # X_train and y_train only. The holdout test set must not influence model
+    # selection, hyperparameter tuning, or threshold selection.
+
+    comparison_df = pd.DataFrame(results_list)
+    return comparison_df
+
+
+def print_phase8_validation_report(tuned_models, comparison_df):
+    """Print the official Phase 8 validation report verifying all tuning constraints."""
+    print("=" * 80)
+    print("PHASE 8: HYPERPARAMETER TUNING VALIDATION REPORT")
+    print("=" * 80)
+    print("1. Tuned Models:")
+    print("   Random Forest")
+    print("   XGBoost")
+    print("\n2. Training Data Used:")
+    print("   X_train, y_train ONLY")
+    print("\n3. Holdout Test Set Used:")
+    print("   False")
+    print("\n4. Cross-Validation:")
+    print("   5-Fold StratifiedKFold")
+    print("\n5. Hyperparameter Search:")
+    print("   RandomizedSearchCV")
+    print("\n6. Search Iterations:")
+    print("   30 per model")
+    print("\n7. Primary Optimization Metric:")
+    print("   PR-AUC (Average Precision)")
+    print("\n8. Random Forest:")
+    print(f"   Best Parameters: {tuned_models['random_forest']['best_params']}")
+    print(f"   Best CV PR-AUC:  {tuned_models['random_forest']['best_cv_pr_auc']:.4f}")
+    print("\n9. XGBoost:")
+    print(f"   Best Parameters: {tuned_models['xgboost']['best_params']}")
+    print(f"   Best CV PR-AUC:  {tuned_models['xgboost']['best_cv_pr_auc']:.4f}")
+    print("\n10. Tuned Model Comparison:")
+    print("-" * 80)
+
+    formatted_df = comparison_df.copy()
+    formatted_df["PR-AUC"] = formatted_df.apply(
+        lambda r: f"{r['pr_auc_mean']:.4f} +/- {r['pr_auc_std']:.4f}", axis=1
+    )
+    formatted_df["F1"] = formatted_df.apply(
+        lambda r: f"{r['f1_mean']:.4f} +/- {r['f1_std']:.4f}", axis=1
+    )
+    formatted_df["Recall"] = formatted_df.apply(
+        lambda r: f"{r['recall_mean']:.4f} +/- {r['recall_std']:.4f}", axis=1
+    )
+    formatted_df["Precision"] = formatted_df.apply(
+        lambda r: f"{r['precision_mean']:.4f} +/- {r['precision_std']:.4f}", axis=1
+    )
+    formatted_df["ROC-AUC"] = formatted_df.apply(
+        lambda r: f"{r['roc_auc_mean']:.4f} +/- {r['roc_auc_std']:.4f}", axis=1
+    )
+
+    display_cols = ["model", "PR-AUC", "F1", "Recall", "Precision", "ROC-AUC"]
+    print(formatted_df[display_cols].to_string(index=False))
+    print("-" * 80)
+
+    # Strict Anti-Leakage and Completion Assertions
+    assert "random_forest" in tuned_models and "xgboost" in tuned_models, "Both RF and XGBoost must be tuned"
+    assert isinstance(tuned_models["random_forest"]["pipeline"], Pipeline), "RF best estimator must be Pipeline"
+    assert isinstance(tuned_models["xgboost"]["pipeline"], Pipeline), "XGBoost best estimator must be Pipeline"
+    assert len(comparison_df) == 2, f"Expected 2 rows in tuned comparison, got {len(comparison_df)}"
+
+    # Confirm models/best_model.joblib is NOT saved prematurely
+    saved_model_path = PROJECT_ROOT / "models" / "best_model.joblib"
+    assert not saved_model_path.exists(), "best_model.joblib must NOT be saved in Phase 8!"
+
+    print("============================================================")
+    print("PHASE 8 CHECKS PASSED: Hyperparameter tuning completed.")
+    print("Holdout test set remains completely sealed.")
+    print("============================================================\n")
 
 
 def print_phase5_validation_report(X, y, X_train, X_test, y_train, y_test, num_features, cat_features):
@@ -556,3 +839,24 @@ if __name__ == "__main__":
         fitted_models=fitted_models,
         n_train=len(X_train),
     )
+
+    # 13. Run Phase 8 Hyperparameter Tuning for Random Forest and XGBoost
+    tuned_models = tune_candidate_models(
+        X_train=X_train,
+        y_train=y_train,
+        preprocessor=preprocessor,
+    )
+
+    # 14. Compare Tuned Models across multiple metrics using 5-Fold Stratified CV
+    tuned_comparison_df = compare_tuned_models(
+        X_train=X_train,
+        y_train=y_train,
+        tuned_models=tuned_models,
+    )
+
+    # 15. Print official Phase 8 validation report
+    print_phase8_validation_report(
+        tuned_models=tuned_models,
+        comparison_df=tuned_comparison_df,
+    )
+
