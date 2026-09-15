@@ -473,9 +473,9 @@ def print_evaluation_summary(results, metadata=None):
 1. Recall (Sensitivity):
    The model achieved a test recall of {:.2f}% (identifying {} out of {} truly disengaged learners).
    In an early warning system, recall is paramount: missing an at-risk learner (False Negative)
-   denies them timely support before the Day 19 assessment deadline, likely leading to course failure
-   or unregistration. Capturing {}/{} of learners heading toward disengagement by Day 14 confirms
-   the model's strong operational sensitivity.
+   means that the learner may not receive timely support before the Day 19 assessment deadline.
+   Capturing {}/{} of learners heading toward disengagement by Day 14 confirms
+   the model's meaningful operational sensitivity.
 
 2. Precision (Positive Predictive Value):
    The model achieved a test precision of {:.2f}% ({} out of {} flagged students were truly disengaged).
@@ -485,12 +485,12 @@ def print_evaluation_summary(results, metadata=None):
    provides an actionable signal while avoiding advisor alert fatigue.
 
 3. F1-Score:
-   The F1-score of {:.4f} reflects a robust harmonic balance between precision and sensitivity
+   The F1-score of {:.4f} reflects a moderate balance between precision and recall
    under a 5.8:1 class imbalance, confirming that the threshold calibration at 0.35 maintained
    viable alert quality while dramatically boosting learner recall.
 
 4. ROC-AUC:
-   The test ROC-AUC of {:.4f} indicates excellent global discriminative capacity across all possible
+   The test ROC-AUC of {:.4f} indicates useful global discriminative capacity across all possible
    decision thresholds. The model ranks randomly selected disengaged students higher than active
    students with ~{:.1f}% probability.
 
